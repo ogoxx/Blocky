@@ -22,8 +22,8 @@ data class AppUpdateInfo(
 
 object UpdateChecker {
     private const val TAG = "UpdateChecker"
-    private const val GITHUB_RELEASES_API_URL = "https://api.github.com/repos/perritodev/Blocky/releases/latest"
-    private const val DEFAULT_RELEASE_PAGE = "https://github.com/perritodev/Blocky/releases/latest"
+    private const val GITHUB_RELEASES_API_URL = "https://api.github.com/repos/ogoxx/Blocky/releases/latest"
+    private const val DEFAULT_RELEASE_PAGE = "https://github.com/ogoxx/Blocky/releases/latest"
 
     /**
      * Compares two semantic version strings (e.g. "1.0.18" vs "v1.0.19").
