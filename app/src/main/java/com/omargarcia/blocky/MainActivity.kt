@@ -89,6 +89,8 @@ import java.util.*
 import com.omargarcia.blocky.utils.CsvContactHelper
 import com.omargarcia.blocky.utils.CsvExportOption
 import com.omargarcia.blocky.utils.DateGroupHelper
+import com.omargarcia.blocky.updater.AppUpdaterProvider
+import com.omargarcia.blocky.updater.UpdateStatus
 import com.omargarcia.blocky.utils.AppUpdateInfo
 import com.omargarcia.blocky.utils.UpdateChecker
 import kotlinx.coroutines.Dispatchers
@@ -171,70 +173,43 @@ fun MainContainer() {
     var repeatCallThreshold by remember { mutableIntStateOf(settingsManager.repeatCallThreshold) }
     var repeatCallIntervalMinutes by remember { mutableIntStateOf(settingsManager.repeatCallIntervalMinutes) }
 
-    val currentAppVersion = remember { UpdateChecker.getCurrentVersionName(context) }
-    var pendingUpdateInfo by remember { mutableStateOf<AppUpdateInfo?>(null) }
-    var isCheckingUpdates by remember { mutableStateOf(false) }
-    var hasPendingUpdate by remember { mutableStateOf(settingsManager.hasPendingUpdate) }
-    var cachedLatestVersion by remember { mutableStateOf(settingsManager.cachedLatestVersion) }
+    val appUpdater = remember { AppUpdaterProvider.create(context) }
+    val updateStatus by appUpdater.status.collectAsState()
+    val activity = context as? ComponentActivity
+
+    val isCheckingUpdates = updateStatus is UpdateStatus.Checking
+    val hasPendingUpdate = updateStatus is UpdateStatus.Available || updateStatus is UpdateStatus.Downloading || updateStatus is UpdateStatus.ReadyToInstall
+    val cachedLatestVersion = when (val s = updateStatus) {
+        is UpdateStatus.Available -> s.latestVersion
+        else -> settingsManager.cachedLatestVersion
+    }
 
     // Daily automatic check for updates on app startup
     LaunchedEffect(Unit) {
-        val lastCheck = settingsManager.lastUpdateCheckTimestamp
-        val now = System.currentTimeMillis()
-        val oneDayMillis = 24 * 60 * 60 * 1000L
-        if (now - lastCheck >= oneDayMillis) {
-            scope.launch(Dispatchers.IO) {
-                UpdateChecker.checkLatestRelease(currentAppVersion).onSuccess { updateInfo ->
-                    settingsManager.lastUpdateCheckTimestamp = System.currentTimeMillis()
-                    if (updateInfo.isUpdateAvailable) {
-                        settingsManager.cachedLatestVersion = updateInfo.latestVersion
-                        settingsManager.hasPendingUpdate = true
-                        withContext(Dispatchers.Main) {
-                            cachedLatestVersion = updateInfo.latestVersion
-                            hasPendingUpdate = true
-                            pendingUpdateInfo = updateInfo
-                        }
-                    } else {
-                        settingsManager.hasPendingUpdate = false
-                        withContext(Dispatchers.Main) {
-                            hasPendingUpdate = false
-                        }
-                    }
-                }
-            }
-        }
+        appUpdater.checkForUpdates(scope, isUserInitiated = false)
     }
 
     val performUpdateCheck: () -> Unit = {
         soundManager.playClick()
-        if (!isCheckingUpdates) {
-            isCheckingUpdates = true
-            scope.launch(Dispatchers.IO) {
-                val result = UpdateChecker.checkLatestRelease(currentAppVersion)
-                settingsManager.lastUpdateCheckTimestamp = System.currentTimeMillis()
-                withContext(Dispatchers.Main) {
-                    isCheckingUpdates = false
-                    result.onSuccess { updateInfo ->
-                        if (updateInfo.isUpdateAvailable) {
-                            settingsManager.cachedLatestVersion = updateInfo.latestVersion
-                            settingsManager.hasPendingUpdate = true
-                            cachedLatestVersion = updateInfo.latestVersion
-                            hasPendingUpdate = true
-                            pendingUpdateInfo = updateInfo
-                        } else {
-                            settingsManager.hasPendingUpdate = false
-                            hasPendingUpdate = false
-                            Toast.makeText(
-                                context,
-                                context.getString(R.string.updates_toast_up_to_date, currentAppVersion),
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        }
-                    }.onFailure {
-                        Toast.makeText(context, R.string.updates_toast_error, Toast.LENGTH_SHORT).show()
-                    }
+        appUpdater.checkForUpdates(scope, isUserInitiated = true)
+    }
+
+    LaunchedEffect(updateStatus) {
+        when (val s = updateStatus) {
+            is UpdateStatus.UpToDate -> {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.updates_toast_up_to_date, s.currentVersion),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            is UpdateStatus.Error -> {
+                val msg = s.messageResId?.let { context.getString(it) } ?: s.customMessage
+                if (!msg.isNullOrBlank()) {
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 }
             }
+            else -> {}
         }
     }
 
@@ -547,29 +522,17 @@ fun MainContainer() {
         }
     }
 
-    if (pendingUpdateInfo != null) {
-        val updateInfo = pendingUpdateInfo!!
+    if (updateStatus is UpdateStatus.Available || updateStatus is UpdateStatus.Downloading || updateStatus is UpdateStatus.ReadyToInstall) {
         UpdateAvailableDialog(
-            updateInfo = updateInfo,
+            updateStatus = updateStatus,
             onDismiss = {
                 soundManager.playClick()
-                pendingUpdateInfo = null
-                settingsManager.lastUpdateCheckTimestamp = System.currentTimeMillis()
+                appUpdater.dismissUpdate()
             },
             onInstallNow = {
                 soundManager.playClick()
-                pendingUpdateInfo = null
-                settingsManager.lastUpdateCheckTimestamp = System.currentTimeMillis()
-                val targetUrl = updateInfo.apkDownloadUrl ?: updateInfo.releaseHtmlUrl
-                val toastMsg = context.getString(R.string.updates_toast_downloading, updateInfo.latestVersion)
-                Toast.makeText(context, toastMsg, Toast.LENGTH_SHORT).show()
-                try {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                    }
-                    context.startActivity(intent)
-                } catch (e: Exception) {
-                    e.printStackTrace()
+                if (activity != null) {
+                    appUpdater.startUpdate(activity, scope)
                 }
             }
         )
@@ -3348,12 +3311,24 @@ fun PrivacyPolicyDialog(onDismiss: () -> Unit) {
 
 @Composable
 fun UpdateAvailableDialog(
-    updateInfo: AppUpdateInfo,
+    updateStatus: UpdateStatus,
     onDismiss: () -> Unit,
     onInstallNow: () -> Unit
 ) {
+    val (latestVer, currentVer, releaseNotes) = when (updateStatus) {
+        is UpdateStatus.Available -> Triple(updateStatus.latestVersion, updateStatus.currentVersion, updateStatus.releaseNotes)
+        is UpdateStatus.Downloading -> Triple(updateStatus.latestVersion, updateStatus.currentVersion, updateStatus.releaseNotes)
+        is UpdateStatus.ReadyToInstall -> Triple(updateStatus.latestVersion, updateStatus.currentVersion, updateStatus.releaseNotes)
+        else -> Triple("", "", "")
+    }
+
+    val isDownloading = updateStatus is UpdateStatus.Downloading
+    val isReadyToInstall = updateStatus is UpdateStatus.ReadyToInstall
+
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            if (!isDownloading) onDismiss()
+        },
         icon = {
             Icon(
                 imageVector = Icons.Default.SystemUpdate,
@@ -3376,30 +3351,77 @@ fun UpdateAvailableDialog(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Surface(
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier.padding(10.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                if (latestVer.isNotBlank()) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = stringResource(
+                                    R.string.update_dialog_version,
+                                    latestVer,
+                                    currentVer
+                                ),
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color.White,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                }
+
+                if (updateStatus is UpdateStatus.Downloading) {
+                    val progress = updateStatus.progressPercent
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = stringResource(R.string.updates_status_downloading, progress),
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            LinearProgressIndicator(
+                                progress = { progress / 100f },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(8.dp)
+                                    .clip(RoundedCornerShape(4.dp)),
+                                color = MaterialTheme.colorScheme.primary,
+                                trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
+                            )
+                        }
+                    }
+                } else if (updateStatus is UpdateStatus.ReadyToInstall) {
+                    Surface(
+                        color = Color(0xFF4CAF50).copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = stringResource(
-                                R.string.update_dialog_version,
-                                updateInfo.latestVersion,
-                                updateInfo.currentVersion
-                            ),
+                            text = stringResource(R.string.updates_status_ready),
                             style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF81C784),
+                            modifier = Modifier.padding(12.dp),
                             textAlign = TextAlign.Center
                         )
                     }
                 }
 
-                if (updateInfo.releaseNotes.isNotBlank()) {
+                if (releaseNotes.isNotBlank()) {
                     Text(
                         text = stringResource(R.string.update_dialog_changelog),
                         style = MaterialTheme.typography.labelLarge,
@@ -3412,7 +3434,7 @@ fun UpdateAvailableDialog(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = updateInfo.releaseNotes,
+                            text = releaseNotes,
                             style = MaterialTheme.typography.bodySmall,
                             color = Color.White.copy(alpha = 0.85f),
                             modifier = Modifier.padding(10.dp)
@@ -3424,6 +3446,7 @@ fun UpdateAvailableDialog(
         confirmButton = {
             Button(
                 onClick = onInstallNow,
+                enabled = !isDownloading,
                 shape = RoundedCornerShape(4.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
             ) {
@@ -3437,11 +3460,13 @@ fun UpdateAvailableDialog(
             }
         },
         dismissButton = {
-            OutlinedButton(
-                onClick = onDismiss,
-                shape = RoundedCornerShape(4.dp)
-            ) {
-                Text(stringResource(R.string.update_dialog_later))
+            if (!isDownloading) {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Text(stringResource(R.string.update_dialog_later))
+                }
             }
         }
     )

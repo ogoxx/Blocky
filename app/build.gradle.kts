@@ -24,10 +24,20 @@ android {
         applicationId = "com.omargarcia.Blocky"
         minSdk = 29
         targetSdk = 37
-        versionCode = 22
-        versionName = "1.0.20"
+        versionCode = 23
+        versionName = "1.0.21"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("github") {
+            dimension = "distribution"
+        }
+        create("play") {
+            dimension = "distribution"
+        }
     }
 
     signingConfigs {
@@ -95,6 +105,10 @@ dependencies {
     // Libphonenumber for Carrier and Geolocation lookup
     implementation(libs.libphonenumber.android)
     
+    // Google Play In-App Updates (Play flavor only)
+    "playImplementation"(libs.play.app.update)
+    "playImplementation"(libs.play.app.update.ktx)
+
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

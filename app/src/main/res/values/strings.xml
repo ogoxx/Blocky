@@ -209,6 +209,8 @@
     <string name="update_dialog_title">New Version Available</string>
     <string name="update_dialog_version">Version %1$s is now available (current: %2$s)</string>
     <string name="update_dialog_changelog">What\'s New</string>
+    <string name="updates_status_downloading">Downloading update (%1$d%%)…</string>
+    <string name="updates_status_ready">Ready to install</string>
     <string name="update_dialog_install_now">Install Now</string>
     <string name="update_dialog_later">Later</string>
 </resources>
