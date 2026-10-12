@@ -190,6 +190,7 @@ class CallBlockerService : CallScreeningService() {
         serviceScope.launch {
             try {
                 historyDao.insert(BlockedCall(phoneNumber = displayLogNumber))
+                StatusIndicatorService.refreshNotification(applicationContext)
             } catch (e: Exception) {
                 Log.e(TAG, "Error inserting blocked call into history", e)
             }

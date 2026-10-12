@@ -21,18 +21,32 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class StatusIndicatorService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var countCollectorJob: Job? = null
+    private var midnightJob: Job? = null
+    private var lastObservedStartOfDay: Long = 0L
     private var currentDailyCount: Int = 0
     private var settingsManager: SettingsManager? = null
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == SettingsManager.KEY_LANGUAGE_CODE) {
             updateNotification()
+        }
+    }
+
+    private val timeChangeReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val currentStartOfToday = DateGroupHelper(applicationContext).startOfTodayMillis
+            if (currentStartOfToday != lastObservedStartOfDay || intent?.action != Intent.ACTION_TIME_TICK) {
+                lastObservedStartOfDay = currentStartOfToday
+                observeDailyBlockedCalls()
+                scheduleMidnightCheck()
+            }
         }
     }
 
@@ -46,6 +60,18 @@ class StatusIndicatorService : Service() {
         settingsManager = SettingsManager(this).also {
             it.registerListener(prefListener)
         }
+        val filter = android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_DATE_CHANGED)
+            addAction(Intent.ACTION_TIME_CHANGED)
+            addAction(Intent.ACTION_TIMEZONE_CHANGED)
+            addAction(Intent.ACTION_TIME_TICK)
+        }
+        try {
+            registerReceiver(timeChangeReceiver, filter)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        scheduleMidnightCheck()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -79,10 +105,11 @@ class StatusIndicatorService : Service() {
 
         if (intent?.action == ACTION_REFRESH_NOTIFICATION) {
             updateNotification()
-            return START_STICKY
         }
 
-        observeDailyBlockedCalls()
+        if (countCollectorJob?.isActive != true) {
+            observeDailyBlockedCalls()
+        }
         
         return START_STICKY
     }
@@ -99,14 +126,35 @@ class StatusIndicatorService : Service() {
         manager?.notify(NOTIFICATION_ID, updatedNotification)
     }
 
+    private fun scheduleMidnightCheck() {
+        midnightJob?.cancel()
+        midnightJob = serviceScope.launch {
+            val now = System.currentTimeMillis()
+            val startOfToday = DateGroupHelper(applicationContext).startOfTodayMillis
+            val nextMidnight = startOfToday + 24 * 60 * 60 * 1000L
+            val delayMillis = (nextMidnight - now).coerceAtLeast(1000L)
+            delay(delayMillis + 500L)
+            observeDailyBlockedCalls()
+            scheduleMidnightCheck()
+        }
+    }
+
     private fun observeDailyBlockedCalls() {
         countCollectorJob?.cancel()
         countCollectorJob = serviceScope.launch {
             val db = AppDatabase.getDatabase(applicationContext)
             val historyDao = db.blockedCallDao()
             val startOfToday = DateGroupHelper(applicationContext).startOfTodayMillis
+            lastObservedStartOfDay = startOfToday
 
             historyDao.getDailyBlockedCount(startOfToday).collect { count ->
+                val currentStartOfToday = DateGroupHelper(applicationContext).startOfTodayMillis
+                if (currentStartOfToday != startOfToday) {
+                    // Midnight crossed or clock changed; restart collector with fresh start-of-day
+                    observeDailyBlockedCalls()
+                    scheduleMidnightCheck()
+                    return@collect
+                }
                 currentDailyCount = count
                 updateNotification()
             }
@@ -174,6 +222,10 @@ class StatusIndicatorService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         settingsManager?.unregisterListener(prefListener)
+        try {
+            unregisterReceiver(timeChangeReceiver)
+        } catch (_: Exception) {}
+        midnightJob?.cancel()
         countCollectorJob?.cancel()
         serviceScope.cancel()
     }
