@@ -19,14 +19,16 @@ import com.omargarcia.blocky.data.BlockedCallDao
 import com.omargarcia.blocky.data.SettingsManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class CallBlockerService : CallScreeningService() {
 
-    private val serviceJob = SupervisorJob()
-    private val serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
+    private var serviceJob = SupervisorJob()
+    private var serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
 
     private var soundPool: SoundPool? = null
     private var hitSoundId: Int = 0
@@ -39,7 +41,9 @@ class CallBlockerService : CallScreeningService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        serviceScope.cancel()
+        serviceJob.cancel()
+        serviceJob = SupervisorJob()
+        serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
         soundPool?.release()
         soundPool = null
     }
@@ -162,7 +166,7 @@ class CallBlockerService : CallScreeningService() {
         }
     }
 
-    private fun blockCall(
+    private suspend fun blockCall(
         callDetails: Call.Details, 
         displayLogNumber: String, 
         historyDao: BlockedCallDao,
@@ -176,24 +180,25 @@ class CallBlockerService : CallScreeningService() {
             .setSkipNotification(true)
             .build()
 
-        // 1. Respond to Telecom IMMEDIATELY with zero latency
-        try {
-            respondToCall(callDetails, response)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error dispatching blockCall response", e)
-        }
-
-        // 2. Play sound alert asynchronously without blocking Telecom
-        playBlockedSound(settingsManager)
-
-        // 3. Persist to Room database asynchronously in background
-        serviceScope.launch {
+        // 1. Persist to Room database and refresh notification first
+        // withContext(NonCancellable) ensures data is written to disk before Telecom unbinds
+        withContext(NonCancellable) {
             try {
                 historyDao.insert(BlockedCall(phoneNumber = displayLogNumber))
                 StatusIndicatorService.refreshNotification(applicationContext)
             } catch (e: Exception) {
                 Log.e(TAG, "Error inserting blocked call into history", e)
             }
+        }
+
+        // 2. Play sound alert
+        playBlockedSound(settingsManager)
+
+        // 3. Respond to Telecom
+        try {
+            respondToCall(callDetails, response)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error dispatching blockCall response", e)
         }
     }
 
